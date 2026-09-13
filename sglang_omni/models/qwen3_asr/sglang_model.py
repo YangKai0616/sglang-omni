@@ -63,7 +63,7 @@ def _fused_asr_forward_prepare_native(
     positions: torch.Tensor,
     hidden_states: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if hidden_states.dtype != torch.bfloat16:
+    if hidden_states.dtype != torch.bfloat16 or fused_qk_norm_rope is None:
         return attention._asr_unfused_forward_prepare_native(
             positions,
             hidden_states,
@@ -72,11 +72,6 @@ def _fused_asr_forward_prepare_native(
         # note(ratish): the prefill CUDA graph bypasses forward()'s int32
         # cast; the kernel rejects int64 positions.
         positions = positions.to(torch.int32)
-    if fused_qk_norm_rope is None:
-        return attention._asr_unfused_forward_prepare_native(
-            positions,
-            hidden_states,
-        )
     qkv, _ = attention.qkv_proj(hidden_states)
     fused_qk_norm_rope(
         qkv,
@@ -102,9 +97,12 @@ def _fused_asr_forward_prepare_native(
 
 
 def _enable_fused_asr_qk_norm_rope(language_model: nn.Module) -> None:
-    # note (luojiaxuan): the CUDA kernel operates in place on packed QKV and
+    # note (luojiaxuan): the sgl-kernel op operates in place on packed QKV and
     # replaces split + two RMSNorm launches + RoPE for the equivalent text
     # positions. Keep the original bound method for non-bfloat16 fallbacks.
+    if fused_qk_norm_rope is None:
+        return
+
     for layer in language_model.model.layers:
         attention = layer.self_attn
         if attention.head_dim not in (64, 128, 256):
@@ -162,10 +160,15 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
     def init_encoder_graphs(
         self, *, max_batch_size: int, max_tokens_per_clip: int
     ) -> None:
+        device = next(self.audio_tower.parameters()).device
+        graph_backend = current_platform.get_device_graph_backend(device)
+        if graph_backend is None:
+            return
         runner = Qwen3ASREncoderLayerStackGraphRunner(
             self.audio_tower,
             buckets=build_buckets(max_batch_size, max_tokens_per_clip),
             max_batch_size=max_batch_size,
+            graph_backend=graph_backend,
         )
         runner.capture_all()
         self._encoder_graph_runner = runner
@@ -268,7 +271,7 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
         if forward_batch.mrope_positions is not None:
             positions = forward_batch.mrope_positions[0]
         positions = positions.to(
-            dtype=torch.int32,
+            dtype=(torch.int32 if fused_qk_norm_rope is not None else torch.long),
             device=input_ids.device,
             non_blocking=True,
         ).contiguous()

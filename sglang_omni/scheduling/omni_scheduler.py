@@ -37,6 +37,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.managers.scheduler import Scheduler as _Upstream
 from sglang.srt.managers.scheduler import validate_input_length
 from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.runtime_context import get_model, get_serving
 from sglang.srt.utils import broadcast_pyobj
 
 from sglang_omni.admission import QueueFullError
@@ -60,14 +61,7 @@ from sglang_omni.proto.admin import (
     ADMIN_WEIGHTS_CHECKER,
 )
 from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
-from sglang_omni.scheduling.prefill_coalesce import (
-    validate_prefill_coalesce_requests,
-    validate_prefill_coalesce_wait_ms,
-)
-from sglang_omni.scheduling.types import DeferredAdmission
-from sglang_omni.vendor.sglang.parallel_state import create_parallel_state
-from sglang_omni.vendor.sglang.server_args import override_server_args
-from sglang_omni.vendor.sglang.signature import supported_kwargs
+from sglang_omni.scheduling.types import ARRequestData, DeferredAdmission
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +72,7 @@ _ABORTED_REQUEST_ID_RETAINED = 5000
 _COMPLETED_REQUEST_ID_LIMIT = 10000
 _PENDING_STREAM_REQUEST_LIMIT = 10000
 _PENDING_STREAM_REQUEST_RETAINED = 5000
+_IDLE_WAIT_S = 0.02
 
 
 class _PendingStreamIngress:
@@ -88,6 +83,16 @@ class _PendingStreamIngress:
     def __init__(self) -> None:
         self.chunks: list[Any] = []
         self.done = False
+
+
+def _compact_decode_input_history(data: ARRequestData) -> None:
+    """A decode input row is a view of the batch snapshot it was written in,
+    so a request that leaves the running batch would keep every snapshot of
+    its run alive while it waits. One copy gives it storage of its own."""
+    history = data.decode_input_embeds
+    if not history:
+        return
+    data.decode_input_embeds = list(torch.stack(history).unbind(0))
 
 
 def _detach_request_data(req: Any) -> None:
@@ -183,8 +188,6 @@ class OmniScheduler:
         server_args: Any,
         model_config: Any,
         *,
-        prefill_manager: Any = None,
-        decode_manager: Any = None,
         model_runner: Any = None,
         request_builder: Callable | None = None,
         result_adapter: Callable | None = None,
@@ -221,11 +224,14 @@ class OmniScheduler:
         self._shutdown_callback = shutdown_callback
         self._shutdown_lock = threading.Lock()
         self._request_admission_lock = threading.RLock()
+        self._prompt_cache_epoch = 0
+        from sglang.srt.runtime_context import get_memory, get_parallel, get_schedule
+
         self.request_build_max_workers = max(1, int(request_build_max_workers))
-        if self.request_build_max_workers > 1 and int(server_args.tp_size) > 1:
+        if self.request_build_max_workers > 1 and int(get_parallel().tp_size) > 1:
             logger.warning(
                 "OmniScheduler request-build workers are disabled for "
-                f"tp_size={server_args.tp_size} to preserve identical request "
+                f"tp_size={get_parallel().tp_size} to preserve identical request "
                 "admission order on every TP rank"
             )
             self.request_build_max_workers = 1
@@ -264,18 +270,18 @@ class OmniScheduler:
         self.model_config = model_config
         self.gpu_id = tp_worker.gpu_id
         self.tp_rank = tp_worker.tp_rank
-        self.tp_size = server_args.tp_size
+        self.tp_size = get_parallel().tp_size
         self.pp_rank = 0
-        self.pp_size = server_args.pp_size
+        self.pp_size = get_parallel().pp_size
         self.dp_rank = None
-        self.dp_size = server_args.dp_size
+        self.dp_size = get_parallel().dp_size
         self.moe_ep_rank = 0
         self.moe_ep_size = 1
         self.moe_dp_rank = None
-        self.moe_dp_size = server_args.moe_dp_size
+        self.moe_dp_size = get_parallel().moe_dp_size
         self.attn_cp_rank = 0
-        self.attn_cp_size = server_args.attn_cp_size
-        self.page_size = server_args.page_size
+        self.attn_cp_size = get_parallel().attn_cp_size
+        self.page_size = get_schedule().page_size
         self.enable_overlap = enable_overlap
         # One-step-lookahead async decode (single stream + CUDA event). Only
         # safe for model runners that implement post_decode_launch/resolve.
@@ -294,14 +300,14 @@ class OmniScheduler:
                 "requests"
             )
 
-        # Note: (maydomine) Validate here as well as in the CLI because per-stage
-        # YAML reaches the scheduler through factory_args.
-        requests = validate_prefill_coalesce_requests(prefill_coalesce_requests)
-        wait_ms = validate_prefill_coalesce_wait_ms(prefill_coalesce_wait_ms)
-        if requests > 1 and int(server_args.tp_size) > 1:
+        # Range and type are enforced at configuration validation
+        # (FactoryArgs); only the TP interaction is this scheduler's call.
+        requests = int(prefill_coalesce_requests)
+        wait_ms = float(prefill_coalesce_wait_ms)
+        if requests > 1 and int(get_parallel().tp_size) > 1:
             logger.warning(
                 "Prefill admission coalescing is disabled for "
-                f"tp_size={server_args.tp_size}: the wait deadline reads each "
+                f"tp_size={get_parallel().tp_size}: the wait deadline reads each "
                 "rank's local clock, so ranks could disagree on expiry and "
                 "break lockstep scheduling"
             )
@@ -337,13 +343,10 @@ class OmniScheduler:
         self.min_free_slots_delayer = None
         self.enable_fpm = False
 
-        # Global server_args field upstream sets in its __init__
-        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.runtime_context import get_context, get_parallel
 
-        gsa = get_global_server_args()
-        if gsa is not None and gsa.pp_max_micro_batch_size is None:
-            override_server_args(
-                gsa,
+        if not get_parallel().pp_max_micro_batch_size:
+            get_context().override(
                 "sglang_omni.scheduler.pp_max_micro_batch_size_default",
                 pp_max_micro_batch_size=max(
                     self.max_running_requests // self.pp_size,
@@ -359,8 +362,6 @@ class OmniScheduler:
         self.tree_cache = tree_cache
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
-        self.prefill_manager = prefill_manager
-        self.decode_manager = decode_manager
 
         # Batch state
         self.waiting_queue: list = []
@@ -384,15 +385,17 @@ class OmniScheduler:
         self._last_pause_mode: str | None = None
 
         # Chunked prefill
-        self.chunked_prefill_size = server_args.chunked_prefill_size
+        self.chunked_prefill_size = get_schedule().chunked_prefill_size
         if self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:
             self.chunked_prefill_size = None
         self.chunked_req = None
         self._pending_chunked_abort_req = None
         self.is_mixed_chunk = (
-            self.chunked_prefill_size is not None and server_args.enable_mixed_chunk
+            self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
         self.enable_dynamic_chunking = False
+        self.prefill_decode_interval = get_schedule().prefill_decode_interval
+        self._prefill_decode_interval_remaining = 0
 
         # Schedule policy
         from sglang.srt.managers.schedule_policy import SchedulePolicy
@@ -401,7 +404,7 @@ class OmniScheduler:
         self.policy = SchedulePolicy(
             self.schedule_policy,
             self.tree_cache,
-            server_args.enable_hierarchical_cache,
+            get_memory().enable_hierarchical_cache,
             server_args.enable_priority_scheduling,
             server_args.schedule_low_priority_values_first,
         )
@@ -417,9 +420,7 @@ class OmniScheduler:
             NewTokenRatioTracker,
         )
 
-        self.new_token_ratio_tracker = NewTokenRatioTracker.from_server_args(
-            server_args
-        )
+        self.new_token_ratio_tracker = NewTokenRatioTracker.from_config()
         self.prefill_delayer = None
         self.lora_drainer = None
 
@@ -445,6 +446,11 @@ class OmniScheduler:
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
         self.spec_algorithm = SpeculativeAlgorithm.NONE
+        self.future_map = self.spec_algorithm.create_future_map(
+            torch.device(self.device),
+            self.req_to_token_pool,
+            needs_cpu_seq_lens=True,
+        )
         self.dllm_config = None
         self.draft_worker = None
         self._execution_bridge = None
@@ -456,6 +462,7 @@ class OmniScheduler:
         self.soft_watchdog = None
         self.recv_skipper = None
         self.idle_sleeper = None
+        self._idle_wait_message: IncomingMessage | None = None
         self._init_upstream_compat_flags(server_args)
         self.grammar_manager = _NoOpGrammarManager()
         self.grammar_queue = []
@@ -534,8 +541,8 @@ class OmniScheduler:
         bridge = SGLangExecutionBridge(
             device=torch.device(self.device),
             worker=self.tp_worker,
-            req_to_token_pool=self.req_to_token_pool,
             spec_algorithm=self.spec_algorithm,
+            future_map=self.future_map,
         )
         model_runner._async_enabled = self.enable_async_decode
         model_runner.bind_execution_bridge(bridge)
@@ -543,7 +550,6 @@ class OmniScheduler:
         # but make the custom ModelRunner the sole owner of relay.
         self._model_runner = model_runner
         self._execution_bridge = bridge
-        self.future_map = bridge.future_map
 
     def _init_upstream_compat_flags(self, server_args: Any) -> None:
         self.enable_hisparse = bool(server_args.enable_hisparse)
@@ -558,7 +564,7 @@ class OmniScheduler:
         self.return_health_check_ipcs = []
         self.enable_overlap_mlx = False
 
-        # Instance state introduced by SGLang 0.5.16's Scheduler.__init__. We
+        # Instance state upstream's Scheduler.__init__ sets. We
         # borrow upstream methods rather than inheriting, so anything they read
         # off ``self`` has to be mirrored here or __getattr__ raises.
         # init_req_max_new_tokens() clamps against this one.
@@ -607,27 +613,21 @@ class OmniScheduler:
         from sglang.srt.managers.scheduler_components.pool_stats_observer import (
             SchedulerPoolStatsObserver,
         )
+        from sglang.srt.runtime_context import get_parallel
 
-        dp_attn_kwargs = dict(
+        self.dp_attn_adapter = SchedulerDPAttnAdapter(
+            model_runner=self.tp_worker.model_runner,
             tp_group=self.tp_group,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
             offload_tags=self.offload_tags,
             ps=self.ps,
-            server_args=self.server_args,
             model_config=self.model_config,
             enable_overlap=self.enable_overlap,
             spec_algorithm=self.spec_algorithm,
             get_require_mlp_sync=lambda: self.require_mlp_sync,
         )
-        dp_attn_kwargs.update(
-            supported_kwargs(
-                SchedulerDPAttnAdapter,
-                model_runner=self._model_runner,
-            )
-        )
-        self.dp_attn_adapter = SchedulerDPAttnAdapter(**dp_attn_kwargs)
         self.pool_stats_observer = SchedulerPoolStatsObserver(
             tree_cache=self.tree_cache,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -640,7 +640,7 @@ class OmniScheduler:
             full_tokens_per_layer=self.full_tokens_per_layer,
             swa_tokens_per_layer=self.swa_tokens_per_layer,
             max_total_num_tokens=(
-                self.max_total_num_tokens * self.server_args.dcp_size
+                self.max_total_num_tokens * get_parallel().attn_dcp_size
             ),
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
@@ -651,7 +651,8 @@ class OmniScheduler:
         self.decode_moment_totals: list[float] = [0.0] * 6
         self._prev_step = None
         self._sched_idled = False
-        load_inquirer_kwargs = dict(
+        self.init_load_publisher()
+        self.load_inquirer = SchedulerLoadInquirer(
             disaggregation_mode=self.disaggregation_mode,
             ps=self.ps,
             server_args=self.server_args,
@@ -663,6 +664,10 @@ class OmniScheduler:
             spec_algorithm=self.spec_algorithm,
             get_running_batch=lambda: self.running_batch,
             get_waiting_queue=lambda: self.waiting_queue,
+            waiting_queue_prefix_matched=lambda: self.policy.waiting_queue_prefix_matched(
+                self.waiting_queue
+            ),
+            get_recent_cache_hit_rate=lambda: self.metrics_reporter.recent_cache_hit_rate,
             get_stats=lambda: self.metrics_reporter.stats,
             get_chunked_req=lambda: self.chunked_req,
             get_disagg_prefill_bootstrap_queue=lambda: empty_queue,
@@ -675,30 +680,24 @@ class OmniScheduler:
             get_spec_total_num_forward_ct=lambda: (
                 self.metrics_reporter.spec_total_num_forward_ct
             ),
-        )
-        current_load_metrics = {
-            "get_total_prefill_uncached_tokens": (
-                lambda: self.total_prefill_uncached_tokens
+            get_total_prefill_uncached_tokens=lambda: (
+                self.total_prefill_uncached_tokens
             ),
-            "get_total_prefill_busy_us": lambda: self.total_prefill_busy_us,
-            "get_decode_moment_totals": lambda: self.decode_moment_totals,
-        }
-        load_inquirer_kwargs.update(
-            supported_kwargs(SchedulerLoadInquirer, **current_load_metrics)
+            get_total_prefill_busy_us=lambda: self.total_prefill_busy_us,
+            get_decode_moment_totals=lambda: self.decode_moment_totals,
         )
-        self.load_inquirer = SchedulerLoadInquirer(**load_inquirer_kwargs)
         self.output_streamer = types.SimpleNamespace(
             stream_output=self.stream_output,
             _stream_output_generation=lambda reqs, return_logprob, **_kwargs: self.stream_output(
                 reqs, return_logprob
             ),
         )
+        self.init_beam_coordinator()
         self.batch_result_processor = SchedulerBatchResultProcessor(
             is_generation=self.is_generation,
             disaggregation_mode=self.disaggregation_mode,
             enable_overlap=self.enable_overlap,
             enable_overlap_mlx=self.enable_overlap_mlx,
-            server_args=self.server_args,
             model_config=self.model_config,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
@@ -710,13 +709,10 @@ class OmniScheduler:
             draft_worker=self.draft_worker,
             model_worker=self.model_worker,
             logprob_result_processor=SchedulerLogprobResultProcessor(
-                **supported_kwargs(
-                    SchedulerLogprobResultProcessor,
-                    server_args=self.server_args,
-                    model_config=self.model_config,
-                )
+                model_config=self.model_config
             ),
             output_streamer=self.output_streamer,
+            beam_coordinator=self.beam_coordinator,
             abort_request=lambda request: self.abort(request.rid),
         )
 
@@ -760,7 +756,9 @@ class OmniScheduler:
         return attr
 
     def _init_parallel_state(self, tp_worker: Any) -> None:
-        enable_dp_attention = self.server_args.enable_dp_attention
+        from sglang.srt.runtime_context import get_parallel
+
+        enable_dp_attention = get_parallel().enable_dp_attention
         (
             self.attn_tp_rank,
             self.attn_tp_size,
@@ -798,11 +796,10 @@ class OmniScheduler:
     def _refresh_upstream_parallel_state(self) -> None:
         """Build the rank container expected by upstream scheduler methods."""
         from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+        from sglang.srt.runtime_context import get_parallel
 
-        self.ps = create_parallel_state(
-            ParallelState,
+        self.ps = ParallelState(
             tp_rank=self.tp_rank,
-            dcp_size=self.server_args.dcp_size,
             tp_size=self.tp_size,
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
@@ -812,6 +809,8 @@ class OmniScheduler:
             attn_tp_size=self.attn_tp_size,
             attn_cp_rank=self.attn_cp_rank,
             attn_cp_size=self.attn_cp_size,
+            attn_dcp_rank=self.tp_rank % get_parallel().dcp_size,
+            attn_dcp_size=get_parallel().dcp_size,
             attn_dp_rank=self.attn_dp_rank,
             attn_dp_size=self.attn_dp_size,
             moe_ep_rank=self.moe_ep_rank,
@@ -853,6 +852,9 @@ class OmniScheduler:
 
     def _drain_local_inbox(self) -> list[IncomingMessage]:
         recv_msgs: list[IncomingMessage] = []
+        if self._idle_wait_message is not None:
+            recv_msgs.append(self._idle_wait_message)
+            self._idle_wait_message = None
         while True:
             try:
                 recv_msgs.append(self.inbox.get_nowait())
@@ -969,7 +971,18 @@ class OmniScheduler:
             request_admission_pending = bool(
                 self._pending_request_builds or self._pending_request_admissions
             )
-        time.sleep(0.0001 if request_admission_pending else 0.001)
+        if request_admission_pending:
+            time.sleep(0.0001)
+            return
+        if self.tp_size > 1 and not self.is_entry_rank:
+            # Note (jzheng17): TP followers receive through broadcast_pyobj, not their inbox.
+            # Keep polling so they can join the entry rank's broadcast promptly.
+            time.sleep(0.001)
+            return
+        try:
+            self._idle_wait_message = self.inbox.get(timeout=_IDLE_WAIT_S)
+        except _queue_mod.Empty:
+            self._idle_wait_message = None
 
     def _queued_admission_count(self) -> int:
         return (
@@ -1222,6 +1235,7 @@ class OmniScheduler:
                     len(self.waiting_queue),
                 )
                 return
+            self._apply_prompt_cache_epoch(req)
             _emit_event(
                 request_id=req_id,
                 stage=None,
@@ -1238,9 +1252,20 @@ class OmniScheduler:
             with self._request_admission_lock:
                 enqueue_if_live()
 
+    def _apply_prompt_cache_epoch(self, req: Any) -> None:
+        cache_key = getattr(req, "_omni_prompt_cache_key", None)
+        if cache_key is not None:
+            req.extra_key = f"{cache_key}:weights:{self._prompt_cache_epoch}"
+
+    def _advance_prompt_cache_epoch(self) -> None:
+        with self._request_admission_lock:
+            self._prompt_cache_epoch += 1
+            for req in self.waiting_queue:
+                self._apply_prompt_cache_epoch(req)
+
     @staticmethod
     def _normalize_req_token_arrays(req: Any) -> None:
-        """Normalize builder-produced token containers to the 0.5.16 Req shape."""
+        """Normalize builder-produced token containers to the upstream Req shape."""
         origin_input_ids = req.origin_input_ids
         if not isinstance(origin_input_ids, array):
             req.origin_input_ids = array("q", origin_input_ids)
@@ -1304,8 +1329,15 @@ class OmniScheduler:
         if required_tokens <= kv_capacity:
             return None
 
-        mem_fraction = self.server_args.mem_fraction_static
-        if mem_fraction is not None:
+        from sglang.srt.runtime_context import get_schedule
+
+        kv_cache_bytes = getattr(
+            getattr(self, "tp_worker", None), "kv_cache_bytes", None
+        )
+        mem_fraction = get_schedule().mem_fraction_static
+        if kv_cache_bytes is not None:
+            mem_hint = " Try raising engine.kv_cache_bytes."
+        elif mem_fraction is not None:
             mem_hint = (
                 f" Current mem_fraction_static is {mem_fraction:.3f}; try setting "
                 "--thinker-mem-fraction-static higher."
@@ -1332,10 +1364,10 @@ class OmniScheduler:
         )
 
     def get_next_batch_to_run(self):
-        """Bridge Omni's batch-owning loops to the 0.5.16 scheduler contract.
+        """Bridge Omni's batch-owning loops to the upstream scheduler contract.
 
-        0.5.16 stopped reading ``running_batch``/``last_batch`` off ``self`` and
-        now returns a ``NextBatchPlan`` instead of the batch. Omni's event loops
+        Upstream takes running_batch and last_batch as arguments instead of
+        reading them off self and returns a NextBatchPlan instead of the batch. Omni's event loops
         own that state, so feed it in and write the (possibly rebuilt) running
         batch back before handing the runnable batch to the caller.
         """
@@ -1349,7 +1381,7 @@ class OmniScheduler:
         # Note: (maydomine) batch prefill admissions to amortize the fixed step
         # cost; the oldest-request deadline survives partial admission and aborts.
         #
-        # 0.5.16 passes ``running_batch`` in and expects a ``NextBatchPlan`` back,
+        # Upstream passes running_batch in and expects a NextBatchPlan back,
         # so the coalesce hold-off returns an empty plan rather than None.
         if self.prefill_coalesce_requests <= 1 or self.chunked_req is not None:
             return _Upstream.get_new_batch_prefill(self, running_batch)
@@ -1387,6 +1419,13 @@ class OmniScheduler:
         except Exception as exc:
             self._handle_batch_failure(batch, exc)
             return _FAILED_BATCH_RESULT
+
+    def process_batch_result(self, batch, result) -> None:
+        _Upstream.process_batch_result(self, batch, result)
+        # note (Richard Wang): cache prompt before blocking tail inserts
+        for req in batch.reqs:
+            if req.output_ids and getattr(req, "_omni_prompt_only_radix", False):
+                req.skip_radix_cache_insert = True
 
     def _stamp_batch_launch(self, batch) -> None:
         """Mirror upstream per-forward bookkeeping for custom runner paths."""
@@ -1475,7 +1514,7 @@ class OmniScheduler:
 
         # Note (wenyao): reuse the runner-staged pinned host copy so the mixin's
         # .tolist() is host-only. The GPU FutureMap relay independently drives
-        # the next-forward input chain under the 0.5.16 execution contract.
+        # the next-forward input chain under the upstream execution contract.
         next_token_ids = mr_output.next_token_ids
         if mr_output.host_token_ids is not None:
             next_token_ids = mr_output.host_token_ids
@@ -1502,7 +1541,7 @@ class OmniScheduler:
         return its GenerationBatchResult.
 
         next_token_ids comes from the resolved step's own batch_result; the
-        live batch carries no token side channel under the 0.5.16 FutureMap
+        live batch carries no token side channel under the upstream FutureMap
         contract.
         """
         from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -1642,7 +1681,7 @@ class OmniScheduler:
                 if model_runner is not None:
                     model_runner.on_request_finished(rid, data)
                 data.output_ids = list(req.output_ids)
-                data.weight_version = self.server_args.weight_version
+                data.weight_version = get_serving().weight_version
                 finished_reason = req.finished_reason
                 data.finish_reason = (
                     finished_reason.to_json().get("type")
@@ -1794,6 +1833,11 @@ class OmniScheduler:
                 if defer_running_cleanup
                 else False
             )
+            immediate_reqs = (
+                []
+                if running_abort
+                else self._mark_request_finished_immediately(request_id)
+            )
             pending = self._pending_request_builds.pop(request_id, None)
             if pending is not None:
                 pending[2].cancel()
@@ -1828,11 +1872,9 @@ class OmniScheduler:
         self._prefill_start_done.discard(request_id)
         self._prefill_end_done.discard(request_id)
         if not running_abort:
-            self._release_immediate_request_resources(request_id)
-            _remove_from_batch(self.running_batch, request_id)
-            _remove_from_batch(self.cur_batch, request_id)
-            _remove_from_batch(self.last_batch, request_id)
-            _remove_from_batch(self._async_pending_batch(), request_id)
+            for req in immediate_reqs:
+                self._release_request_kv_cache(req)
+                _detach_request_data(req)
         self._drain_inbox_for_request(request_id)
 
     def admin(
@@ -1915,9 +1957,7 @@ class OmniScheduler:
         }
 
     def _admin_model_info(self) -> dict[str, Any]:
-        info = {}
-        if hasattr(self.model_worker, "model_info"):
-            info.update(self.model_worker.model_info())
+        info = self.model_worker.model_info()
         with self._request_admission_lock:
             request_build_pending = len(self._pending_request_builds)
             request_admission_pending = len(self._pending_request_admissions)
@@ -1938,9 +1978,9 @@ class OmniScheduler:
                     self._request_build_max_pending_observed
                 ),
                 "running_batch_size": len(self.running_batch.reqs),
-                "model_path": self.server_args.model_path,
-                "load_format": self.server_args.load_format,
-                "weight_version": self.server_args.weight_version,
+                "model_path": get_model().model_path,
+                "load_format": get_model().load_format,
+                "weight_version": get_serving().weight_version,
             }
         )
         return {"success": True, "message": "ok", "data": info}
@@ -1988,12 +2028,6 @@ class OmniScheduler:
     def _admin_update_weights_from_disk(
         self, payload: dict[str, Any]
     ) -> dict[str, Any]:
-        if not hasattr(self.model_worker, "update_weights_from_disk"):
-            return {
-                "success": True,
-                "message": "stage does not support update_weights_from_disk",
-                "data": {"skipped": True, "unsupported": True},
-            }
         return self._run_weight_update_with_lifecycle(
             payload,
             self.model_worker.update_weights_from_disk,
@@ -2053,6 +2087,8 @@ class OmniScheduler:
                     if keep_pause_on_failure:
                         keep_engine_paused = True
                     raise
+                if success:
+                    self._advance_prompt_cache_epoch()
                 flush_success: bool | None = None
                 if success and bool(payload.get("flush_cache", True)):
                     flush_success = self._flush_cache_after_update()
@@ -2088,32 +2124,18 @@ class OmniScheduler:
     def _admin_update_weights_from_tensor(
         self, payload: dict[str, Any]
     ) -> dict[str, Any]:
-        if not hasattr(self.model_worker, "update_weights_from_tensor"):
-            return {
-                "success": True,
-                "message": "stage does not support update_weights_from_tensor",
-                "data": {"skipped": True, "unsupported": True},
-            }
-        with self._admin_lock:
-            success, message = self.model_worker.update_weights_from_tensor(payload)
-        return {
-            "success": bool(success),
-            "message": str(message),
-            "data": {
+        return self._run_weight_update_with_lifecycle(
+            payload,
+            self.model_worker.update_weights_from_tensor,
+            {
                 "metadata_only": payload.get("serialized_named_tensors") is None,
             },
-            "error": None if success else str(message),
-        }
+            keep_pause_on_failure=True,
+        )
 
     def _admin_update_weights_from_distributed(
         self, payload: dict[str, Any]
     ) -> dict[str, Any]:
-        if not hasattr(self.model_worker, "update_weights_from_distributed"):
-            return {
-                "success": True,
-                "message": "stage does not support update_weights_from_distributed",
-                "data": {"skipped": True, "unsupported": True},
-            }
         return self._run_weight_update_with_lifecycle(
             payload,
             self.model_worker.update_weights_from_distributed,
@@ -2127,12 +2149,6 @@ class OmniScheduler:
     def _admin_init_weights_update_group(
         self, payload: dict[str, Any]
     ) -> dict[str, Any]:
-        if not hasattr(self.model_worker, "init_weights_update_group"):
-            return {
-                "success": True,
-                "message": "stage does not support init_weights_update_group",
-                "data": {"skipped": True, "unsupported": True},
-            }
         # Note (Xuesong): init blocks on a NCCL/TCP rendezvous and runs on the
         # scheduler serving thread (admin is drained inline in the event loop), so
         # the serving loop is frozen until the trainer (rank 0) joins. sglang's
@@ -2156,12 +2172,6 @@ class OmniScheduler:
     def _admin_destroy_weights_update_group(
         self, payload: dict[str, Any]
     ) -> dict[str, Any]:
-        if not hasattr(self.model_worker, "destroy_weights_update_group"):
-            return {
-                "success": True,
-                "message": "stage does not support destroy_weights_update_group",
-                "data": {"skipped": True, "unsupported": True},
-            }
         with self._admin_lock:
             success, message = self.model_worker.destroy_weights_update_group(payload)
         return {
@@ -2172,12 +2182,6 @@ class OmniScheduler:
         }
 
     def _admin_weights_checker(self, payload: dict[str, Any]) -> dict[str, Any]:
-        if not hasattr(self.model_worker, "weights_checker"):
-            return {
-                "success": True,
-                "message": "stage does not support weights_checker",
-                "data": {"skipped": True, "unsupported": True},
-            }
         action = str(payload.get("action") or "checksum")
         with self._admin_lock:
             data = self.model_worker.weights_checker(action)
@@ -2187,6 +2191,15 @@ class OmniScheduler:
         request_ids = self._active_request_ids()
         for request_id in request_ids:
             self.abort(request_id, defer_running_cleanup=False)
+        seen: set[int] = set()
+        for batch in (self.running_batch, self.cur_batch, self.last_batch):
+            if batch is None or id(batch) in seen:
+                continue
+            seen.add(id(batch))
+            batch.filter_batch()
+            if not batch.reqs:
+                batch.batch_is_full = False
+        self.chunked_req = None
         return len(request_ids)
 
     def _active_request_ids(self) -> list[str]:
@@ -2227,6 +2240,11 @@ class OmniScheduler:
         )
         return bool(engine_paused and self._last_pause_mode == "retract")
 
+    def _add_request_to_queue(self, req: Any, is_retracted: bool = False) -> None:
+        if req.is_retracted:
+            _compact_decode_input_history(req._omni_data)
+        _Upstream._add_request_to_queue(self, req, is_retracted=is_retracted)
+
     def _retract_running_requests(self) -> int:
         batch = self.running_batch
         if batch is None or batch.is_empty():
@@ -2234,13 +2252,11 @@ class OmniScheduler:
         batch.filter_batch()
         if len(batch.reqs) == 0:
             return 0
-        # sglang 0.5.16 dropped ScheduleBatch.retract_all; the module-level
-        # function returns None and leaves batch.reqs in place, so snapshot the
-        # requests and clear the batch here (what the old method did for us).
+        # ScheduleBatch has no retract_all; the module-level function leaves
+        # batch.reqs in place, so snapshot the requests and clear the batch here.
         retracted_reqs = list(batch.reqs)
         retract_all(
             reqs=batch.reqs,
-            server_args=self.server_args,
             req_to_token_pool=batch.req_to_token_pool,
             token_to_kv_pool_allocator=batch.token_to_kv_pool_allocator,
             tree_cache=batch.tree_cache,
@@ -2292,16 +2308,9 @@ class OmniScheduler:
                 marked = True
         return marked
 
-    def _run_abort_callback(self, request_id: str) -> None:
-        callback = self._abort_callback
-        if callback is None:
-            return
-        try:
-            callback(request_id)
-        except Exception:
-            logger.exception("OmniScheduler: abort cleanup failed for %s", request_id)
-
-    def _release_immediate_request_resources(self, request_id: str) -> None:
+    def _mark_request_finished_immediately(self, request_id: str) -> list[Any]:
+        """Make immediate cleanup visible without rewriting prepared batches."""
+        matches = []
         seen: set[int] = set()
         for batch in (
             self.running_batch,
@@ -2315,10 +2324,24 @@ class OmniScheduler:
                 if req.rid != request_id or id(req) in seen:
                     continue
                 seen.add(id(req))
-                self._release_request_kv_cache(req)
+                matches.append(req)
+                if not req.finished():
+                    if req.to_finish is None:
+                        req.to_finish = FINISH_ABORT()
+                    req.update_finish_state()
+        return matches
+
+    def _run_abort_callback(self, request_id: str) -> None:
+        callback = self._abort_callback
+        if callback is None:
+            return
+        try:
+            callback(request_id)
+        except Exception:
+            logger.exception("OmniScheduler: abort cleanup failed for %s", request_id)
 
     def _release_request_kv_cache(self, req: Any) -> None:
-        if req.req_pool_idx is None and req.mamba_pool_idx is None:
+        if not req.kv.holds_kv and not req.kv.holds_mamba:
             return
         release_kv_cache(req, self.tree_cache)
 
@@ -2450,7 +2473,7 @@ class OmniScheduler:
         _resolve_and_process; the fast path previously dropped only finished.
 
         The dropped rows' step slots need no compensating free: the batch's
-        prepare already advanced req.kv_committed_len over them, and the
+        prepare already advanced req.kv.kv_committed_len over them, and the
         drain's release_kv_cache frees or caches every committed slot, so
         a second free here would put a slot on the free list that the radix
         tree (or another request) still owns.
@@ -2710,17 +2733,3 @@ class OmniScheduler:
             req_data.stream_done = True
             return
         self._stream_done_handler(req_data)
-
-
-def _remove_from_batch(batch: Any, request_id: str) -> None:
-    if batch is None:
-        return
-    remaining_reqs = []
-    for req in batch.reqs:
-        if req.rid == request_id:
-            _detach_request_data(req)
-        else:
-            remaining_reqs.append(req)
-    batch.reqs = remaining_reqs
-    if not batch.reqs:
-        batch.batch_is_full = False

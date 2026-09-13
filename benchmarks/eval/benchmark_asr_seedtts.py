@@ -1,22 +1,25 @@
-# SPDX-License-Identifier: Apache-2.0
-# Author:
-# chenyang zhao: https://github.com/zhaochenyang20
-# PoTaTo-Mika: https://github.com/PoTaTo-Mika
 """ASR concurrency benchmark on SeedTTS reference audio (issue #646).
 
 This script transcribes SeedTTS reference clips directly through a running ASR
 router and reports WER, request throughput, RTFx, RTF, latency, and worker
-routing balance. It supports both Qwen3-ASR and Fun-ASR-Nano through
-``--model-path``.
+routing balance.
+
+Author:
+
+    Chenyang Zhao https://github.com/zhaochenyang20
+    PoTaTo-Mika https://github.com/PoTaTo-Mika
 
 Usage:
 
-    # Download the test set once:
+    1. Download the test set once:
     python -m benchmarks.dataset.prepare --dataset seedtts
 
-    # Pin and launch Qwen3-ASR:
-    MODEL_PATH=$(hf download Qwen/Qwen3-ASR-1.7B \
-        --revision 7278e1e70fe206f11671096ffdd38061171dd6e5)
+    2. Pin and launch Qwen3-ASR:
+    MODEL_PATH="$(
+      hf download Qwen/Qwen3-ASR-1.7B \
+        --revision 7278e1e70fe206f11671096ffdd38061171dd6e5 \
+        --quiet
+    )"
     sgl-omni serve \
         --model-path "${MODEL_PATH}" \
         --model-name Qwen/Qwen3-ASR-1.7B \
@@ -134,11 +137,7 @@ def _parse_concurrencies(value: str) -> list[int]:
 def _evaluation_input_sha256(
     samples: list[SampleInput], *, namespace: str = "seedtts"
 ) -> str:
-    """Fingerprint the exact evaluation input: ids, texts, and audio bytes.
-
-    *namespace* keeps digests from different datasets distinct; the SeedTTS
-    default reproduces the digests this script has always written.
-    """
+    """Fingerprint the exact evaluation input: ids, texts, and audio bytes."""
     digest = hashlib.sha256(f"{namespace}-evaluation-input-v1\0".encode())
     for sample in samples:
         for value in (sample.sample_id, sample.ref_text, sample.target_text):
@@ -154,17 +153,35 @@ def _evaluation_input_sha256(
 
 
 def _fetch_worker_snapshot(host: str, port: int) -> dict | None:
-    """Best-effort read of the router /workers snapshot (None if unavailable)."""
-    try:
-        response = requests.get(
-            f"http://{host}:{port}/workers",
-            timeout=10,
-            proxies={"http": None, "https": None},
+    """Best-effort read of per-worker router dispatch counters."""
+    with requests.Session() as session:
+        session.trust_env = False
+        for path in ("/diagnostics", "/workers"):
+            try:
+                response = session.get(f"http://{host}:{port}{path}", timeout=10)
+                response.raise_for_status()
+                payload = response.json()
+                if path == "/diagnostics":
+                    return _normalize_rust_worker_snapshot(payload)
+                return payload
+            except (requests.RequestException, ValueError, TypeError):
+                continue
+    return None
+
+
+def _normalize_rust_worker_snapshot(snapshot: dict) -> dict:
+    workers = []
+    for worker in snapshot.get("workers", []):
+        dispatches = worker.get("dispatches", [])
+        workers.append(
+            {
+                "display_id": worker.get("worker_id"),
+                "routed_requests": sum(
+                    int(entry.get("requests", 0)) for entry in dispatches
+                ),
+            }
         )
-        response.raise_for_status()
-        return response.json()
-    except Exception:
-        return None
+    return {"workers": workers}
 
 
 def _worker_delta(before: dict | None, after: dict | None) -> dict:
@@ -174,17 +191,21 @@ def _worker_delta(before: dict | None, after: dict | None) -> dict:
 
     def _by_id(snapshot: dict, key: str) -> dict[str, int]:
         return {
-            str(w.get("display_id")): int(w.get(key, 0))
-            for w in snapshot.get("workers", [])
+            str(worker.get("display_id", worker.get("worker_id"))): int(
+                worker.get(key, 0)
+            )
+            for worker in snapshot.get("workers", [])
         }
 
     out: dict[str, object] = {}
     for key in ("routed_requests", "successful_requests", "failed_requests"):
+        if not any(key in worker for worker in after.get("workers", [])):
+            continue
         before_by_id = _by_id(before, key)
         after_by_id = _by_id(after, key)
         deltas = {
-            wid: after_by_id.get(wid, 0) - before_by_id.get(wid, 0)
-            for wid in after_by_id
+            worker_id: after_by_id.get(worker_id, 0) - before_by_id.get(worker_id, 0)
+            for worker_id in after_by_id
         }
         out[f"total_{key}"] = sum(deltas.values())
         if key == "routed_requests":
@@ -217,7 +238,6 @@ async def run_asr_seedtts_once(
         stream=stream,
     )
     after = _fetch_worker_snapshot(host, port)
-
     benchmark_result = build_asr_eval_results(
         samples,
         outputs,

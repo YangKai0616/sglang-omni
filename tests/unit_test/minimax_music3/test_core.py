@@ -176,16 +176,16 @@ def test_minimax_music3_explicit_placements_ignore_the_machine(
         dual_stages = {stage.name: stage for stage in dual.stages}
         single_stages = {stage.name: stage for stage in single.stages}
         assert dual_stages["minimax_music3_ar"].gpu == 0
-        assert dual_stages["minimax_music3_ar"].factory_args["max_concurrency"] == 16
+        assert dual_stages["minimax_music3_ar"].factory.max_concurrency == 16
         assert dual_stages["dit_dav"].gpu == 1
-        assert dual_stages["dit_dav"].factory_args["dtype"] == "float32"
-        assert dual_stages["dit_dav"].factory_args["breakable_cuda_graph"] is False
+        assert dual_stages["dit_dav"].factory.dtype == "float32"
+        assert dual_stages["dit_dav"].factory.breakable_cuda_graph is False
         assert dual.placement.require_memory_fraction_for_colocation
         assert single_stages["minimax_music3_ar"].gpu == 0
-        assert single_stages["minimax_music3_ar"].factory_args["max_concurrency"] == 16
+        assert single_stages["minimax_music3_ar"].factory.max_concurrency == 16
         assert single_stages["dit_dav"].gpu == 0
-        assert single_stages["dit_dav"].factory_args["dtype"] == "float32"
-        assert single_stages["dit_dav"].factory_args["breakable_cuda_graph"] is False
+        assert single_stages["dit_dav"].factory.dtype == "float32"
+        assert single_stages["dit_dav"].factory.breakable_cuda_graph is False
         assert not single.placement.require_memory_fraction_for_colocation
 
 
@@ -219,12 +219,12 @@ def test_minimax_music3_default_follows_the_visible_gpus(
     stages = {stage.name: stage for stage in config.stages}
     assert stages["minimax_music3_ar"].gpu == 0
     assert stages["dit_dav"].gpu == acoustic_gpu
-    assert stages["dit_dav"].factory_args["dtype"] == acoustic_dtype
-    assert stages["dit_dav"].factory_args["compile_acoustic"] is True
+    assert stages["dit_dav"].factory.dtype == acoustic_dtype
+    assert stages["dit_dav"].factory.compile_acoustic is True
     assert config.placement.require_memory_fraction_for_colocation is colocation_check
-    assert MiniMaxMusic3PipelineConfig.mem_fraction_role_to_stage() == {
-        "talker": "minimax_music3_ar"
-    }
+    assert MiniMaxMusic3PipelineConfig.stage_config_cls(
+        "minimax_music3_ar"
+    ).engine_stage
 
 
 def test_native_attention_preserves_checkpoint_state_dict_keys() -> None:
@@ -238,6 +238,21 @@ def test_native_attention_preserves_checkpoint_state_dict_keys() -> None:
     assert "diffusion_transformer.transformer.layers.0.self_attn.to_qkv.weight" in keys
     assert "diffusion_transformer.transformer.layers.35.self_attn.to_out.weight" in keys
     assert not any(".backend." in key for key in keys)
+
+
+def test_auto_attention_backend_accepts_the_platform_fallback(monkeypatch) -> None:
+    from sglang.multimodal_gen.runtime.layers.attention import selector
+    from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import SDPABackend
+
+    monkeypatch.setattr(selector, "_cached_get_attn_backend", lambda *_: SDPABackend)
+    with torch.device("meta"):
+        model = MiniMaxMusic3DIT(
+            compute_dtype=torch.float32,
+            attention_backend="auto",
+        )
+
+    attention = model.diffusion_transformer.transformer.layers[0].self_attn
+    assert attention.backend.backend is AttentionBackendEnum.TORCH_SDPA
 
 
 def test_dav_weight_norm_folding_preserves_output() -> None:

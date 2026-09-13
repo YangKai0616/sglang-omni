@@ -86,7 +86,9 @@ Supported Models
    :caption: Get Started
 
    get_started/installation.md
+   get_started/installation_npu.md
    get_started/installation_xpu.md
+   get_started/installation_cpu.md
 
 
 .. toctree::
@@ -110,7 +112,10 @@ Supported Models
    cookbook/whisper_asr.md
    cookbook/qwen3_omni.md
    cookbook/ming_omni.md
+   cookbook/nemotron_voicechat.md
    cookbook/llada2_uni.md
+   cookbook/fun_cosyvoice3.md
+   cookbook/auk.md
 
 .. toctree::
    :maxdepth: 1
@@ -119,6 +124,7 @@ Supported Models
    basic_usage/qwen3_omni.md
    basic_usage/audio_translations.md
    basic_usage/tts.md
+   basic_usage/process_topology.md
    basic_usage/tts_process_topology.md
    basic_usage/process_topology_migration.md
    basic_usage/omni_router.md
@@ -140,8 +146,10 @@ Supported Models
    developer_reference/apiserver_design.md
    developer_reference/pipeline.md
    developer_reference/config.md
+   developer_reference/adding_parameters.md
    developer_reference/communication.md
    developer_reference/reference_encode_service.md
    developer_reference/profiler.md
    developer_reference/qwen3_asr_concurrency_profile.md
    developer_reference/rl_admin_control.md
+   developer_reference/bump_version.md

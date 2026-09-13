@@ -12,9 +12,15 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
+from sglang.srt.layers.attention.vision import VisionAttentionMetadata
+
+from sglang_omni.platforms import current_platform
+
+if TYPE_CHECKING:
+    from sglang_omni.platforms.device_graph import DeviceGraphBackend
 
 logger = logging.getLogger(__name__)
 
@@ -50,9 +56,10 @@ def build_buckets(max_batch: int, max_tokens_per_clip: int) -> tuple[int, ...]:
 
 @dataclass
 class _CapturedGraph:
-    graph: torch.cuda.CUDAGraph
+    graph: Any  # the accelerator's graph type, named per backend
     hidden_states: torch.Tensor  # [bucket, hidden] static input
     cu_seqlens: torch.Tensor  # [max_windows + 1] static window boundaries
+    attention_metadata: VisionAttentionMetadata | None
     output: torch.Tensor  # [bucket, output_dim] static result
 
 
@@ -72,11 +79,14 @@ class Qwen3ASREncoderLayerStackGraphRunner:
         *,
         buckets: tuple[int, ...],
         max_batch_size: int,
+        graph_backend: DeviceGraphBackend,
     ) -> None:
         self._tower = audio_tower
+        self._graph_backend = graph_backend
         param = next(audio_tower.parameters())
         self._device = param.device
         self._dtype = param.dtype
+        self._device_module = torch.get_device_module(self._device)
         cfg = audio_tower.config
 
         chunk_tokens = _get_feat_extract_output_lengths_int(cfg.n_window * 2)
@@ -88,6 +98,7 @@ class Qwen3ASREncoderLayerStackGraphRunner:
         self._buckets = buckets[:-1] + (top + self._max_windows_for(top),)
         self._graphs: dict[int, _CapturedGraph] = {}  # bucket size -> recorded graph
         self._failed: set[int] = set()
+        self._capture_attention_metadata: VisionAttentionMetadata | None = None
 
     @property
     def tokens_per_window(self) -> int:
@@ -118,7 +129,11 @@ class Qwen3ASREncoderLayerStackGraphRunner:
         for layer in tower.layers:
             residual = h
             h = layer.self_attn_layer_norm(h)
-            h = layer.self_attn(x=h, cu_seqlens=cu_seqlens, max_seqlen=self._max_seqlen)
+            attention_kwargs = dict(
+                max_seqlen=self._max_seqlen,
+                forward_metadata=self._capture_attention_metadata,
+            )
+            h = layer.self_attn(x=h, cu_seqlens=cu_seqlens, **attention_kwargs)
             h = residual + h
             residual = h
             h = layer.final_layer_norm(h)
@@ -144,21 +159,36 @@ class Qwen3ASREncoderLayerStackGraphRunner:
         for size in sizes:
             bounds.append(bounds[-1] + size)
         static_cu = torch.tensor(bounds, dtype=torch.int32, device=device)
+        attention_metadata = None
+        if current_platform.is_rocm():
+            # VisionAiterAttention otherwise recomputes max_seqlen with
+            # seq_lens.max().item() inside the captured region. The device-to-host
+            # sync is illegal during HIP graph capture. Keep the mutable tensor
+            # metadata static and supply the architectural maximum as a host scalar.
+            attention_metadata = VisionAttentionMetadata(
+                cu_seqlens=static_cu,
+                seq_lens=static_cu[1:] - static_cu[:-1],
+                max_seqlen=self._max_seqlen,
+            )
+        self._capture_attention_metadata = attention_metadata
 
         def run_once() -> torch.Tensor:
             with torch.no_grad():
                 return self._layer_stack(static_hs, static_cu)
 
-        side = torch.cuda.Stream(device)
-        side.wait_stream(torch.cuda.current_stream(device))
-        with torch.cuda.stream(side):
+        device_module = self._device_module
+        side = device_module.Stream(device)
+        side.wait_stream(device_module.current_stream(device))
+        with device_module.stream(side):
             for _ in range(3):
                 run_once()
-        torch.cuda.current_stream(device).wait_stream(side)
-        torch.cuda.synchronize(device)
+        device_module.current_stream(device).wait_stream(side)
+        device_module.synchronize(device)
 
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, capture_error_mode="thread_local"):
+        # Note (siju): each bucket keeps its own pool. Sharing one is only safe
+        # for graphs replayed in capture order, and a request picks its bucket
+        # from the clip length, so any order is possible.
+        with self._graph_backend.capture(thread_local_errors=True) as graph:
             static_out = run_once()
         logger.info(
             "[qwen3-asr] captured encoder layer-stack graph bucket=%d windows=%d out=%s",
@@ -170,6 +200,7 @@ class Qwen3ASREncoderLayerStackGraphRunner:
             graph=graph,
             hidden_states=static_hs,
             cu_seqlens=static_cu,
+            attention_metadata=attention_metadata,
             output=static_out,
         )
 
@@ -212,6 +243,8 @@ class Qwen3ASREncoderLayerStackGraphRunner:
 
         entry.hidden_states[:total].copy_(hidden_states)
         entry.cu_seqlens.copy_(cu, non_blocking=True)
+        if entry.attention_metadata is not None:
+            entry.attention_metadata.seq_lens.copy_(cu[1:] - cu[:-1], non_blocking=True)
         entry.graph.replay()
         out = entry.output
         if out.dim() == 3:  # attention backends emit [1, tokens, dim]
