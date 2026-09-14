@@ -8,19 +8,21 @@ pipeline.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 from sglang.srt.arg_groups.overrides import collect_model_override_declarations
 
 from sglang_omni.models.qwen3_tts import stages as qwen3_stages
 from sglang_omni.models.qwen3_tts.config import Qwen3TTSPipelineConfig
-from tests.unit_test.fakes import FakeServerArgs
 
 
-def _server_args(device: str, attention_backend: str | None) -> FakeServerArgs:
-    return FakeServerArgs(
+def _server_args(device: str, attention_backend: str | None) -> SimpleNamespace:
+    return SimpleNamespace(
         device=device,
         attention_backend=attention_backend,
-        is_attention_backend_not_set=lambda: attention_backend is None,
+        prefill_attention_backend=None,
+        decode_attention_backend=None,
     )
 
 
