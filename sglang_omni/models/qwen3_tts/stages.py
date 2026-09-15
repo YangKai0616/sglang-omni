@@ -11,8 +11,10 @@ from collections.abc import Sequence
 from typing import Any
 
 import torch
-from sglang.srt.arg_groups.model_override_base import is_attention_backend_not_set
-from sglang.srt.arg_groups.overrides import register_model_override
+from sglang.srt.arg_groups.overrides import (
+    is_attention_backend_not_set,
+    register_model_override,
+)
 
 from sglang_omni.models.qwen3_tts.compat import (
     apply_qwen_tts_transformers_compatibility_patches,
