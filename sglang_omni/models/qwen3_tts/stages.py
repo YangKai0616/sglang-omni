@@ -11,6 +11,7 @@ from collections.abc import Sequence
 from typing import Any
 
 import torch
+from sglang.srt.arg_groups.model_override_base import is_attention_backend_not_set
 from sglang.srt.arg_groups.overrides import register_model_override
 
 from sglang_omni.models.qwen3_tts.compat import (
@@ -118,7 +119,7 @@ def _qwen3_tts_overrides(server_args: Any, hf_config: Any) -> dict[str, Any]:
     del hf_config
     if server_args.device != "xpu":
         return {}
-    if not server_args.is_attention_backend_not_set():
+    if not is_attention_backend_not_set(server_args):
         return {}
     logger.warning("Use intel_xpu as attention backend on xpu for Qwen3-TTS model")
     return {"attention_backend": "intel_xpu"}
