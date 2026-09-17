@@ -149,14 +149,22 @@ def _register_qwen3_tts_hf_config() -> None:
 
 @register_model_override("Qwen3TTSForConditionalGeneration")
 def _qwen3_tts_overrides(server_args: Any, hf_config: Any) -> dict[str, Any]:
-    """Auto-select the intel_xpu attention backend"""
+    """Let the active platform pick Qwen3-TTS's attention backend."""
     del hf_config
-    if server_args.device != "xpu":
+    # The platform is detected from the host, not from --device.
+    if server_args.device != current_platform.device_type:
+        return {}
+    backend = current_platform.get_qwen3_tts_attention_backend()
+    if backend is None:
         return {}
     if not is_attention_backend_not_set(server_args):
         return {}
-    logger.warning("Use intel_xpu as attention backend on xpu for Qwen3-TTS model")
-    return {"attention_backend": "intel_xpu"}
+    logger.warning(
+        "Use %s as attention backend on %s for Qwen3-TTS model",
+        backend,
+        current_platform.device_type,
+    )
+    return {"attention_backend": backend}
 
 
 def _load_qwen3_tts_generate_defaults(checkpoint_dir: str) -> dict[str, Any]:
