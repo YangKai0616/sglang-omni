@@ -112,7 +112,7 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
         self._device = torch.device(device)
         self._device_module = torch.get_device_module(self._device)
         self._graph_backend = current_platform.get_device_graph_backend(self._device)
-        self._accelerator = self._device.type == current_platform.device_type
+        self._async_device = current_platform.supports_async_streams(self._device)
         self._dtype = dtype
         self._num_quantizers = int(num_quantizers)
         self._mode = str(mode).strip().lower()
@@ -408,7 +408,7 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
     def _device_guard(self) -> contextlib.AbstractContextManager[Any]:
         # torch.cpu exposes no device context, so off the accelerator this is
         # the no-op that torch.cuda.device(cpu_device) used to be.
-        if self._accelerator:
+        if self._async_device:
             return self._device_module.device(self._device)
         return contextlib.nullcontext()
 
@@ -437,7 +437,7 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
             self._reset_graph(captured.graph, context=f"{context} for {key}")
         graphs.clear()
         gc.collect()
-        if not self._accelerator:
+        if not self._async_device:
             return
         try:
             with self._device_guard():

@@ -30,7 +30,7 @@ def _allocate_pinned(numel: int, dtype: torch.dtype) -> torch.Tensor:
 
 def _normalize_device(device: torch.device | str | int) -> torch.device:
     resolved = torch.device(device)
-    if resolved.type == current_platform.device_type and resolved.index is None:
+    if current_platform.supports_async_streams(resolved) and resolved.index is None:
         module = torch.get_device_module(resolved)
         return torch.device(resolved.type, module.current_device())
     return resolved
@@ -117,7 +117,7 @@ class PinnedTransferSlot:
         return self._buffer.view(numel)
 
     def _device_guard(self) -> contextlib.AbstractContextManager[Any]:
-        if self.device.type == current_platform.device_type:
+        if current_platform.supports_async_streams(self.device):
             return self._device_module.device(self.device)
         return contextlib.nullcontext()
 

@@ -41,10 +41,7 @@ class Qwen3TTSCodecStateArena:
             raise ValueError("Qwen3-TTS codec state arena needs at least one slot")
         self._decoder = decoder
         self._device = torch.device(device)
-        # note: an arena on the platform's own accelerator gets the stream and
-        # event ordering below; anything else (CPU, or another vendor's device
-        # in the same process) runs the plain synchronous path.
-        self._accelerator = self._device.type == current_platform.device_type
+        self._async_device = current_platform.supports_async_streams(self._device)
         self._device_module = torch.get_device_module(self._device)
         self._dtype = dtype
         self._num_slots = int(num_slots)
@@ -110,7 +107,7 @@ class Qwen3TTSCodecStateArena:
 
     def release(self, slot: int) -> None:
         released = None
-        if self._accelerator:
+        if self._async_device:
             released = self._device_module.Event()
             released.record(self._device_module.current_stream(self._device))
         with self._lock:
@@ -152,7 +149,7 @@ class Qwen3TTSCodecStateArena:
     _STAGING_RING = 4
 
     def _staged(self, name: str, values: Sequence[int]) -> torch.Tensor:
-        if not self._accelerator:
+        if not self._async_device:
             return torch.as_tensor(list(values), dtype=torch.long)
         count = len(values)
         if count == 0:
