@@ -99,10 +99,13 @@ RUN cd /workspace/sglang-omni \
     && cp pyproject_xpu.toml pyproject.toml \
     && pip install --no-cache-dir -e . --no-build-isolation --extra-index-url ${TORCH_XPU_INDEX}
 
-# --no-deps: qwen-tts pins Transformers 4.57.3, which would replace the stack above,
-# and resolving sox lifts numpy past the numba==0.65.1 ceiling.
-RUN pip install --no-cache-dir --no-deps sox einops \
-    && pip install --no-cache-dir --no-deps qwen-tts==0.1.1
+# SGLang's XPU manifest omits xgrammar because its metadata pulls CUDA-only
+# dependencies. Keep these pins aligned with the SGLang release above.
+# --no-deps also prevents qwen-tts from replacing Transformers 5.12.1 and sox
+# from lifting numpy past the numba==0.65.1 ceiling.
+RUN pip install --no-cache-dir apache-tvm-ffi==0.1.11 jiwer \
+    && pip install --no-cache-dir --no-deps \
+        xgrammar==0.1.33 sox einops qwen-tts==0.1.1
 
 WORKDIR /workspace/sglang-omni
 
