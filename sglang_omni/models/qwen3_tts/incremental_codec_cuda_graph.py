@@ -132,6 +132,8 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
         self._configured = bool(
             enabled
             and self._graph_backend is not None
+            # The capture runs on its own stream, so a backend alone is not enough.
+            and self._async_device
             and self._device.index is not None
             and self._num_quantizers > 0
             and self._fresh_frames

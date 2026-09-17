@@ -333,6 +333,11 @@ def test_a_platform_declines_a_device_that_is_not_its_own() -> None:
 
 
 def test_platforms_declare_async_stream_support() -> None:
+    """The Qwen3-TTS vocoder path reads this, so it names the devices it ran on.
+
+    NPU has streams of its own but has never run that path; it stays off until
+    someone validates it there.
+    """
     from sglang_omni.platforms.apple import AppleOmniPlatform
     from sglang_omni.platforms.musa import MUSAOmniPlatform
     from sglang_omni.platforms.npu import NPUOmniPlatform
@@ -342,9 +347,8 @@ def test_platforms_declare_async_stream_support() -> None:
         ROCMOmniPlatform,
         MUSAOmniPlatform,
         xpu_platform.XPUOmniPlatform,
-        NPUOmniPlatform,
     )
-    unsupported = (CPUOmniPlatform, AppleOmniPlatform, OmniPlatform)
+    unsupported = (NPUOmniPlatform, CPUOmniPlatform, AppleOmniPlatform, OmniPlatform)
 
     for platform_class in supported:
         platform = platform_class()

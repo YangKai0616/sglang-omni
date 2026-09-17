@@ -9,14 +9,12 @@ from sglang_omni.platforms.interface import OmniPlatform
 
 if TYPE_CHECKING:
     from sglang_omni.platforms.device_graph import DeviceGraphBackend
-    from sglang_omni.profiler.torch_profiler import TorchProfiler
 
 
 class NPUOmniPlatform(OmniPlatform):
     _enum: PlatformEnum = PlatformEnum.NPU
     device_name: str = "npu"
     device_type: str = "npu"
-    has_async_device_streams = True
 
     def _get_device_graph_backend(self) -> DeviceGraphBackend:
         from sglang_omni.platforms.device_graph import NpuDeviceGraphBackend

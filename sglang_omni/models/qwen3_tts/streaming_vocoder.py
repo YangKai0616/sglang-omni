@@ -433,7 +433,12 @@ class _Qwen3TTSInitialDecodeGraphs:
         self._batch_sizes = tuple(sorted(set(int(size) for size in batch_sizes)))
         self._device_module = torch.get_device_module(device)
         self._graph_backend = current_platform.get_device_graph_backend(device)
-        self._enabled = bool(enabled and self._graph_backend is not None)
+        # The capture runs on its own stream, so a backend alone is not enough.
+        self._enabled = bool(
+            enabled
+            and self._graph_backend is not None
+            and current_platform.supports_async_streams(device)
+        )
         self._graphs: dict[tuple[int, int], Any] = {}
         self._inputs: dict[tuple[int, int], torch.Tensor] = {}
         self._outputs: dict[tuple[int, int], torch.Tensor] = {}
