@@ -433,7 +433,7 @@ class _Qwen3TTSInitialDecodeGraphs:
         self._batch_sizes = tuple(sorted(set(int(size) for size in batch_sizes)))
         self._device_module = torch.get_device_module(device)
         self._graph_backend = current_platform.get_device_graph_backend(device)
-        # The capture runs on its own stream, so a backend alone is not enough.
+        # The capture needs a stream of its own, which a backend alone does not imply.
         self._enabled = bool(
             enabled
             and self._graph_backend is not None

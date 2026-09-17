@@ -97,12 +97,10 @@ class XpuDeviceGraphBackend:
             kwargs["stream"] = stream
         capture = torch.xpu.graph(xpu_graph=graph, **kwargs)
         with ExitStack() as stack:
-            # Note: the XPU generator allocates its seed and offset staging
-            # tensors when the process's first graph registers, and refills
-            # them on every later capture. Opening with inference mode
-            # suspended keeps them ordinary tensors, so a capture recorded
-            # under inference_mode does not decide whether a later capture
-            # recorded under no_grad can refill them.
+            # The XPU generator allocates its seed and offset staging tensors on
+            # the process's first capture and refills them on every later one, so
+            # a capture under inference_mode would leave them inference tensors
+            # and a later capture under no_grad could not refill them.
             with torch.inference_mode(False):
                 stack.enter_context(capture)
             yield graph

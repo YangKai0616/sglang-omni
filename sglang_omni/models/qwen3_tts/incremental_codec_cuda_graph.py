@@ -132,7 +132,6 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
         self._configured = bool(
             enabled
             and self._graph_backend is not None
-            # The capture runs on its own stream, so a backend alone is not enough.
             and self._async_device
             and self._device.index is not None
             and self._num_quantizers > 0
@@ -408,8 +407,7 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
         self._retained_capture_resources.clear()
 
     def _device_guard(self) -> contextlib.AbstractContextManager[Any]:
-        # torch.cpu exposes no device context, so off the accelerator this is
-        # the no-op that torch.cuda.device(cpu_device) used to be.
+        # torch.cpu has no device context, where torch.cuda.device(cpu) was a no-op.
         if self._async_device:
             return self._device_module.device(self._device)
         return contextlib.nullcontext()
