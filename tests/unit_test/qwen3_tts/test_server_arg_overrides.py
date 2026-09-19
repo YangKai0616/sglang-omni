@@ -49,7 +49,7 @@ def test_the_platform_hook_decides_the_attention_backend(
     monkeypatch.setattr(qwen3_stages, "current_platform", platform())
 
     assert (
-        qwen3_stages._qwen3_tts_overrides(
+        qwen3_stages.qwen3_tts_overrides(
             _server_args(device, attention_backend), object()
         )
         == expected
