@@ -102,7 +102,7 @@ class Qwen3TTSCodecStateArena:
             released = self._release_events.pop(slot, None)
         if released is not None:
             self._device_module.current_stream(self._device).wait_event(released)
-        self._zero_slot(slot)
+        self.zero_slot(slot)
         return slot
 
     def release(self, slot: int) -> None:
@@ -141,14 +141,14 @@ class Qwen3TTSCodecStateArena:
             *state.transformer_values.values(),
         ]
 
-    def _zero_slot(self, slot: int) -> None:
+    def zero_slot(self, slot: int) -> None:
         for buffer in self._buffers(self._storage):
             buffer[slot].zero_()
         self._storage.frame_positions[slot] = 0
 
     _STAGING_RING = 4
 
-    def _staged(self, name: str, values: Sequence[int]) -> torch.Tensor:
+    def staged(self, name: str, values: Sequence[int]) -> torch.Tensor:
         if not self._async_device:
             return torch.as_tensor(list(values), dtype=torch.long)
         count = len(values)
@@ -181,7 +181,7 @@ class Qwen3TTSCodecStateArena:
 
     def stage_index(self, slots: Sequence[int]) -> torch.Tensor:
         """Stage a cohort's slot ids on the device without a host sync."""
-        return self._staged("index", slots)
+        return self.staged("index", slots)
 
     def gather(self, slots: Sequence[int]) -> Qwen3TTSIncrementalCodecState:
         """Select a cohort's rows into one contiguous state."""
@@ -223,17 +223,17 @@ class Qwen3TTSCodecStateArena:
             raise RuntimeError(
                 "Qwen3-TTS codec state arena requires per-row frame positions"
             )
-        self._copy_rows(storage.frame_positions, index, state.frame_positions)
+        self.copy_rows(storage.frame_positions, index, state.frame_positions)
         for key, buffer in storage.conv_histories.items():
-            self._copy_rows(buffer, index, state.conv_histories[key], key)
+            self.copy_rows(buffer, index, state.conv_histories[key], key)
         for key, buffer in storage.transconv_overlaps.items():
-            self._copy_rows(buffer, index, state.transconv_overlaps[key], key)
+            self.copy_rows(buffer, index, state.transconv_overlaps[key], key)
         for layer_index, buffer in storage.transformer_keys.items():
-            self._copy_rows(
+            self.copy_rows(
                 buffer, index, state.transformer_keys[layer_index], f"key.{layer_index}"
             )
         for layer_index, buffer in storage.transformer_values.items():
-            self._copy_rows(
+            self.copy_rows(
                 buffer,
                 index,
                 state.transformer_values[layer_index],
@@ -241,7 +241,7 @@ class Qwen3TTSCodecStateArena:
             )
 
     @staticmethod
-    def _copy_rows(
+    def copy_rows(
         buffer: torch.Tensor,
         index: torch.Tensor,
         rows: torch.Tensor,
