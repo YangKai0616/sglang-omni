@@ -173,6 +173,8 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
         capture_stream: Any | None = None
         try:
             with self.device_guard():
+                # note (ratish): once per pass; a collect per key walks the whole heap
+                gc.collect()
                 before = self.memory_snapshot()
                 self._memory_stats["before"] = before
                 self.require_headroom(before["free_bytes"])
@@ -190,7 +192,6 @@ class Qwen3TTSIncrementalCodecCudaGraphRunner:
                         pool=pool,
                         capture_stream=capture_stream,
                     )
-                    gc.collect()
                     self._device_module.empty_cache()
                     self.require_headroom(
                         self._device_module.mem_get_info(self._device)[0],
