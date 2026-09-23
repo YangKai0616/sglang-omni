@@ -2069,14 +2069,12 @@ def test_qwen3_tts_predictor_graph_requires_a_device_graph_backend(
         "get_device_graph_backend",
         lambda _device: None,
     )
-    monkeypatch.setattr(
-        sglang_model,
-        "get_exec",
-        lambda: SimpleNamespace(graph=SimpleNamespace(disable_cuda_graph=False)),
-    )
-    monkeypatch.setattr(
-        sglang_model, "get_parallel", lambda: SimpleNamespace(tp_size=1)
-    )
+    for bag in ("get_parallel", "get_exec"):
+        monkeypatch.setattr(
+            sglang_model,
+            bag,
+            lambda: (_ for _ in ()).throw(AssertionError("must not read config")),
+        )
     talker = sglang_model.Qwen3TTSTalker.__new__(sglang_model.Qwen3TTSTalker)
     talker._predictor_device = torch.empty(1).device
 
