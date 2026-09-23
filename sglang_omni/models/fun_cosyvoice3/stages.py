@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib
 import logging
 import os
@@ -921,7 +922,7 @@ def load_cosyvoice3_flow_hift(
     )
     del cv.model.llm
     wrapped = FunCosyVoice3Flow(
-        flow, packed_estimator=PackedDiT(flow.decoder.estimator)
+        flow, packed_estimator=PackedDiT(flow.decoder.estimator, device=device)
     )
     if enable_flow_estimator_trt:
         attach_flow_estimator_trt(wrapped, checkpoint_dir, device)
@@ -1058,7 +1059,9 @@ def load_cosyvoice3_flow_hift_lightweight(
         hift = MpsHiFTAdapter(hift, device)
     del configs
     return (
-        FunCosyVoice3Flow(flow, packed_estimator=PackedDiT(flow.decoder.estimator)),
+        FunCosyVoice3Flow(
+            flow, packed_estimator=PackedDiT(flow.decoder.estimator, device=device)
+        ),
         hift,
     )
 
@@ -1137,7 +1140,9 @@ def compile_dit_backbone(
             CHUNK_MASK_COMPILE_DISABLED = True
     try:
         estimator.forward = torch.compile(original_forward, dynamic=True)
-        param = next(estimator.parameters())
+        # note(ratish): serving feeds the Flow's dtype; the DiT's weights may
+        # already be in the autocast dtype.
+        param = next(flow.parameters())
         device, dtype = param.device, param.dtype
         mel_frame = int(warmup_mel_frames)
         with torch.inference_mode():
@@ -1367,6 +1372,18 @@ class CosyVoice3Vocoder(BatchVocoderBase):
         self.hift_autocast_dtype = AUTOCAST_DTYPES[hift_dtype]
         self.hift_max_padding_waste = hift_max_padding_waste
         self.hift_samples_per_mel_frame: int | None = None
+        # note(ratish): the AR shares this process and the default stream; on its
+        # own stream the vocoder's kernels and host copies do not queue behind the
+        # AR's. It waits once for what the default stream holds at this point.
+        device = next(self.flow.parameters()).device
+        if device.type == "cuda":
+            stream = torch.cuda.Stream(device=device)
+            stream.wait_stream(torch.cuda.current_stream(device))
+            self.stream_context: contextlib.AbstractContextManager[None] = (
+                torch.cuda.stream(stream)
+            )
+        else:
+            self.stream_context = contextlib.nullcontext()
 
     def prepare_item(
         self, payload: StagePayload
@@ -1406,45 +1423,46 @@ class CosyVoice3Vocoder(BatchVocoderBase):
             flow_merge_pad_budget_percent=self.flow_merge_pad_budget_percent,
         )
         flow_device = next(self.flow.parameters()).device
-        for flow_group in flow_groups:
-            with torch.autocast(
-                device_type=flow_device.type,
-                dtype=self.autocast_dtype,
-                enabled=self.autocast_dtype is not None,
-            ):
-                mel_list = self.flow.inference(
-                    [request.flow_input for request in flow_group]
-                )
-            ordered = sorted(
-                zip(flow_group, mel_list, strict=True),
-                key=lambda pair: int(pair[1].shape[-1]),
-            )
-            group: list[tuple[Any, torch.Tensor]] = []
-            total = 0
-            longest = 0
-            max_waste = self.hift_max_padding_waste
-            hift_groups: list[list[tuple[Any, torch.Tensor]]] = []
-            for pair in ordered:
-                length = int(pair[1].shape[-1])
-                candidate_longest = max(longest, length)
-                candidate_total = total + length
-                if (
-                    group
-                    and candidate_longest * (len(group) + 1)
-                    > max_waste * candidate_total
+        with self.stream_context:
+            for flow_group in flow_groups:
+                with torch.autocast(
+                    device_type=flow_device.type,
+                    dtype=self.autocast_dtype,
+                    enabled=self.autocast_dtype is not None,
                 ):
+                    mel_list = self.flow.inference(
+                        [request.flow_input for request in flow_group]
+                    )
+                ordered = sorted(
+                    zip(flow_group, mel_list, strict=True),
+                    key=lambda pair: int(pair[1].shape[-1]),
+                )
+                group: list[tuple[Any, torch.Tensor]] = []
+                total = 0
+                longest = 0
+                max_waste = self.hift_max_padding_waste
+                hift_groups: list[list[tuple[Any, torch.Tensor]]] = []
+                for pair in ordered:
+                    length = int(pair[1].shape[-1])
+                    candidate_longest = max(longest, length)
+                    candidate_total = total + length
+                    if (
+                        group
+                        and candidate_longest * (len(group) + 1)
+                        > max_waste * candidate_total
+                    ):
+                        hift_groups.append(group)
+                        group, total, longest = [], 0, 0
+                        candidate_longest = length
+                        candidate_total = length
+                    group.append(pair)
+                    total, longest = candidate_total, candidate_longest
+                if group:
                     hift_groups.append(group)
-                    group, total, longest = [], 0, 0
-                    candidate_longest = length
-                    candidate_total = length
-                group.append(pair)
-                total, longest = candidate_total, candidate_longest
-            if group:
-                hift_groups.append(group)
-            for group in hift_groups:
-                wavs = self.mel2wav_batch([mel for _, mel in group])
-                for (request, _), wav in zip(group, wavs, strict=True):
-                    results[request.index] = (wav, request.sample_rate)
+                for group in hift_groups:
+                    wavs = self.mel2wav_batch([mel for _, mel in group])
+                    for (request, _), wav in zip(group, wavs, strict=True):
+                        results[request.index] = (wav, request.sample_rate)
 
         if any(result is None for result in results):
             raise RuntimeError("Fun-CosyVoice3 vocoder did not decode every request")
@@ -2062,6 +2080,13 @@ def create_vocoder_executor(
         enable_flow_cuda_graph = False
 
     patch_chunk_mask()
+
+    if autocast_dtype is not None and device_obj.type == "cuda":
+        # note(ratish): autocast caches no weight cast under inference mode, so
+        # each Linear and Conv1d would recast its weights on every Euler step.
+        for module in flow.decoder.estimator.modules():
+            if isinstance(module, (torch.nn.Linear, torch.nn.Conv1d)):
+                module.to(autocast_dtype)
 
     if enable_dit_torch_compile:
         compile_dit_backbone(flow, autocast_dtype=autocast_dtype)
