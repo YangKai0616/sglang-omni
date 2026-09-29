@@ -234,27 +234,32 @@ def with_attention_backend(monkeypatch, backend: str | None) -> None:
 @pytest.mark.parametrize(
     ("kwargs", "expected"),
     [
-        ({"device": "xpu"}, {"device": "xpu", "attention_backend": "intel_xpu"}),
+        (
+            {"device": "accel"},
+            {"device": "accel", "attention_backend": "platform_attn"},
+        ),
         ({"device": "cpu"}, {"device": "cpu"}),
         (
-            {"device": "xpu", "attention_backend": "triton"},
-            {"device": "xpu", "attention_backend": "triton"},
+            {"device": "accel", "attention_backend": "triton"},
+            {"device": "accel", "attention_backend": "triton"},
         ),
         (
-            {"device": "xpu", "prefill_attention_backend": "triton"},
-            {"device": "xpu", "prefill_attention_backend": "triton"},
+            {"device": "accel", "prefill_attention_backend": "triton"},
+            {"device": "accel", "prefill_attention_backend": "triton"},
         ),
         (
-            {"device": "xpu", "decode_attention_backend": "triton"},
-            {"device": "xpu", "decode_attention_backend": "triton"},
+            {"device": "accel", "decode_attention_backend": "triton"},
+            {"device": "accel", "decode_attention_backend": "triton"},
         ),
     ],
 )
 def test_the_platform_attention_backend_only_fills_an_unset_backend(
     monkeypatch, kwargs: dict[str, Any], expected: dict[str, Any]
 ) -> None:
-    monkeypatch.setattr(platforms.current_platform, "device_type", "xpu", raising=False)
-    with_attention_backend(monkeypatch, "intel_xpu")
+    monkeypatch.setattr(
+        platforms.current_platform, "device_type", "accel", raising=False
+    )
+    with_attention_backend(monkeypatch, "platform_attn")
 
     server_args_builder.apply_platform_attention_backend(kwargs)
 
@@ -264,7 +269,7 @@ def test_the_platform_attention_backend_only_fills_an_unset_backend(
 def test_only_an_opted_in_builder_gets_the_platform_attention_backend(
     monkeypatch,
 ) -> None:
-    with_attention_backend(monkeypatch, "intel_xpu")
+    with_attention_backend(monkeypatch, "platform_attn")
 
     opted_out = drive_build_kwargs(monkeypatch, overrides=None)
     opted_in = drive_build_kwargs(
@@ -272,4 +277,4 @@ def test_only_an_opted_in_builder_gets_the_platform_attention_backend(
     )
 
     assert "attention_backend" not in opted_out
-    assert opted_in["attention_backend"] == "intel_xpu"
+    assert opted_in["attention_backend"] == "platform_attn"
