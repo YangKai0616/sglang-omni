@@ -163,7 +163,7 @@ def test_cpu_platform_keeps_cpu_transfer_slots_synchronous(monkeypatch):
     from sglang_omni.platforms.cpu import CPUOmniPlatform
 
     monkeypatch.setattr(cuda_staging, "current_platform", CPUOmniPlatform())
-    created = _install_fake_events(monkeypatch)
+    created = install_fake_events(monkeypatch)
     slot = PinnedTransferSlot("cpu", torch.float32)
 
     slot.record(object())
