@@ -68,7 +68,7 @@ class XPUOmniPlatform(OmniPlatform):
 
         return Backend.FULL
 
-    def get_qwen3_tts_attention_backend(self) -> str | None:
+    def get_sglang_attention_backend(self) -> str | None:
         return "intel_xpu"
 
     def get_graph_capture_sdpa_backends(self) -> tuple["SDPBackend", ...]:
